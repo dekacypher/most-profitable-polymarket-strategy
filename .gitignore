@@ -1,0 +1,22 @@
+# Env and secrets
+.env
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+venv/
+.venv/
+
+# Logs and state
+bot/logs/
+*.log
+bot/logs/trades.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
