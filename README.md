@@ -27,6 +27,15 @@ python -m bot.main --live --env .env
 python -m bot.run_24h --live --env .env
 ```
 
-## Repo
+## Push to your private GitHub repo
 
-Standalone copy of the most profitable strategy from the reverse-engineer-polymarket project. Private.
+1. On GitHub: **New repository** → name: `most-profitable-polymarket-strategy` → **Private** → Create (do not add README or .gitignore).
+2. From this folder:
+   ```bash
+   git push -u origin main
+   ```
+   Remote is already set to `git@github.com:dekacypher/most-profitable-polymarket-strategy.git`. If you use a different GitHub user/org, change it:
+   ```bash
+   git remote set-url origin git@github.com:YOUR_USER/most-profitable-polymarket-strategy.git
+   git push -u origin main
+   ```
