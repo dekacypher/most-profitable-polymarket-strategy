@@ -62,17 +62,18 @@ class TopOfBook:
 @dataclass
 class MarketWindow:
     """A single BTC 15-minute market window with both tokens."""
-    condition_id: str
+    condition_id: str               # On-chain CTF condition ID (for redeem)
     question: str
     up_token_id: str
     down_token_id: str
     end_time: str
-    end_time_epoch: float = 0.0  # Parsed epoch for deadline comparisons
+    end_time_epoch: float = 0.0     # Parsed epoch for deadline comparisons
     slug: Optional[str] = None
+    event_id: str = ""              # Gamma API event ID (for resolution checks)
 
     @property
     def window_id(self) -> str:
-        return self.condition_id
+        return self.condition_id or self.event_id
 
     @property
     def is_past_end_time(self) -> bool:

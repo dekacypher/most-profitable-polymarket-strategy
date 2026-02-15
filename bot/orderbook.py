@@ -54,6 +54,13 @@ class OrderbookMonitor:
             if tob:
                 self._cache[token_id] = tob
             return tob
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                # 404 = market expired/closed — expected, not a real error
+                logger.debug("Book 404 for %s (expired market)", token_id[:8])
+            else:
+                logger.warning("Book fetch failed for %s: %s", token_id[:8], exc)
+            return None
         except httpx.HTTPError as exc:
             logger.warning("Book fetch failed for %s: %s", token_id[:8], exc)
             return self._cache.get(token_id)

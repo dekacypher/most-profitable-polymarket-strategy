@@ -21,6 +21,7 @@ from bot.orderbook import OrderbookMonitor
 from bot.position_tracker import PositionTracker
 from bot.risk import RiskManager
 from bot.strategy import CompleteSetStrategy
+from bot.telegram import TelegramNotifier
 from bot.types import (
     CompleteSet,
     LegOrder,
@@ -43,6 +44,7 @@ class BotEngine:
         self._order_manager = OrderManager(config)
         self._risk = RiskManager(config)
         self._tracker = PositionTracker(config)
+        self._telegram = TelegramNotifier()
         self._quoted_windows: set[str] = set()
         self._running = False
         self._last_scan_log: float = 0
@@ -53,7 +55,9 @@ class BotEngine:
         logger.info("Starting bot engine in %s mode", mode)
 
         await self._start_components()
+        await self._telegram.start()
         self._running = True
+        await self._telegram.send(f"*BOT STARTED* ({mode} mode)")
 
         try:
             await asyncio.gather(
@@ -67,6 +71,8 @@ class BotEngine:
             logger.info("Bot engine shutting down")
         finally:
             self._running = False
+            await self._telegram.send("*BOT STOPPED*")
+            await self._telegram.stop()
             await self._stop_components()
             self._tracker.persist()
             logger.info("Bot engine stopped")
@@ -121,7 +127,7 @@ class BotEngine:
         while self._running:
             await asyncio.sleep(self._config.status_report_interval)
             try:
-                self._log_status()
+                await self._log_status()
             except Exception:
                 logger.exception("Error in status report")
 
@@ -220,6 +226,10 @@ class BotEngine:
             decision.up_bid_price + decision.down_bid_price,
             decision.edge,
         )
+        await self._telegram.notify_quote(
+            window.question, decision.up_bid_price, decision.down_bid_price,
+            decision.edge, decision.size,
+        )
 
     # ── Fill monitoring ────────────────────────────────────────────
 
@@ -245,6 +255,12 @@ class BotEngine:
                     "Both legs filled for set %s — holding for resolution",
                     cs.set_id,
                 )
+                await self._telegram.notify_complete_set(
+                    cs.set_id,
+                    cs.window.question if cs.window else "unknown",
+                    cs.combined_cost,
+                    cs.edge_per_share,
+                )
 
     # ── Redemption monitoring ──────────────────────────────────────
 
@@ -260,10 +276,15 @@ class BotEngine:
         """
         for cs in self._tracker.active_sets:
             if cs.state == SetState.COMPLETE:
+                logger.info(f"Checking transition to awaiting resolution for set {cs.set_id}")
                 await self._check_transition_to_awaiting(cs)
 
             elif cs.state == SetState.AWAITING_RESOLUTION:
-                await self._attempt_redemption(cs)
+                logger.info(f"Attempting redemption for set {cs.set_id}")
+                try:
+                    await self._attempt_redemption(cs)
+                except Exception:
+                    logger.exception(f"Error attempting redemption for set {cs.set_id}")
 
     async def _check_transition_to_awaiting(self, cs: CompleteSet) -> None:
         """Transition COMPLETE → AWAITING_RESOLUTION as soon as window ends (redeem ASAP)."""
@@ -271,12 +292,27 @@ class BotEngine:
             return
 
         grace = self._config.redemption_grace_seconds
+
+        # Normal path: end_time is known and has passed
         if cs.window.is_past_end_time and cs.window.seconds_since_end >= grace:
             self._tracker.mark_awaiting_resolution(cs.set_id)
             logger.info(
                 "Set %s past end_time (%.0fs ago) — attempting redemption as soon as resolved",
                 cs.set_id, cs.window.seconds_since_end,
             )
+            return
+
+        # Fallback: if end_time_epoch is 0 (parsing failed), force transition
+        # after the set has been COMPLETE for > 20 minutes (15-min window + buffer)
+        if cs.window.end_time_epoch <= 0 and cs.completed_at:
+            age = time.time() - cs.completed_at
+            if age > 1200:  # 20 minutes
+                self._tracker.mark_awaiting_resolution(cs.set_id)
+                logger.warning(
+                    "Set %s has no parseable end_time but completed %.0fs ago — "
+                    "forcing transition to AWAITING_RESOLUTION",
+                    cs.set_id, age,
+                )
 
     async def _attempt_redemption(self, cs: CompleteSet) -> None:
         """Try to redeem a set that's awaiting resolution."""
@@ -293,17 +329,20 @@ class BotEngine:
                 deadline,
             )
 
-        # Check if market has actually resolved on-chain
-        resolved = await self._order_manager.check_market_resolved(
-            cs.window.condition_id
-        )
+        # Check if market has actually resolved on-chain (use event_id for Gamma API)
+        event_id = cs.window.event_id or cs.window.condition_id
+        resolved = await self._order_manager.check_market_resolved(event_id)
         if not resolved:
             return
 
-        # Attempt redemption
-        success, error = await self._order_manager.redeem_complete_set(
-            cs.window.condition_id
-        )
+        # Attempt redemption (use condition_id — the actual on-chain CTF condition ID)
+        condition_id = cs.window.condition_id
+        if not condition_id:
+            logger.error(
+                "Set %s has no CTF condition_id — cannot redeem!", cs.set_id
+            )
+            return
+        success, error = await self._order_manager.redeem_complete_set(condition_id)
 
         if success:
             self._risk.record_redemption_success()
@@ -313,9 +352,13 @@ class BotEngine:
             logger.info(
                 "REDEEMED set %s — PnL $%.4f", cs.set_id, pnl,
             )
+            await self._telegram.notify_redeemed(cs.set_id, pnl)
         else:
             self._tracker.mark_redemption_failed(cs.set_id, error)
             self._risk.record_redemption_failure()
+            await self._telegram.notify_error(
+                f"Redemption failed for set {cs.set_id}", error
+            )
 
             if self._risk.suspected_blacklist:
                 logger.critical(
@@ -396,6 +439,7 @@ class BotEngine:
         logger.warning(
             "Abandoned set %s — loss $%.4f", cs.set_id, abs(loss),
         )
+        await self._telegram.notify_abandoned(cs.set_id, loss)
 
     # ── Helpers ────────────────────────────────────────────────────
 
@@ -422,7 +466,7 @@ class BotEngine:
         await self._orderbook.stop()
         await self._market_finder.stop()
 
-    def _log_status(self) -> None:
+    async def _log_status(self) -> None:
         risk = self._risk.snapshot(self._tracker.active_sets)
         pnl = self._tracker.pnl_summary()
 
@@ -442,4 +486,8 @@ class BotEngine:
             pnl["sets_awaiting_resolution"],
             len(self._quoted_windows),
             "ON" if risk.kill_switch_active else "off",
+        )
+        await self._telegram.notify_status(
+            risk.open_sets, pnl["total_pnl"],
+            pnl["sets_redeemed"], pnl["sets_abandoned"],
         )

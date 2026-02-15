@@ -140,10 +140,6 @@ class MarketFinder:
 
         event = events[0]
 
-        # Skip closed events
-        if event.get("closed", False):
-            return None
-
         # Extract market data
         markets = event.get("markets", [])
         if not markets or len(markets) == 0:
@@ -151,8 +147,16 @@ class MarketFinder:
 
         market = markets[0]
 
-        # Skip if not accepting orders
-        if not market.get("acceptingOrders", False):
+        # Skip closed events and markets not accepting orders — their
+        # orderbooks return 404 and we can't quote them anyway.
+        # Redemption monitor doesn't use find_active_windows(); it tracks
+        # sets internally, so skipping closed markets here is safe.
+        is_closed = event.get("closed", False)
+        accepting_orders = market.get("acceptingOrders", False)
+
+        if is_closed or not accepting_orders:
+            logger.debug("Market %s closed=%s acceptingOrders=%s — skipping",
+                        slug, is_closed, accepting_orders)
             return None
 
         question = market.get("question", "")
@@ -168,14 +172,24 @@ class MarketFinder:
         # Parse end time
         end_date = event.get("endDate", "")
 
+        # The REAL on-chain CTF condition ID lives on the market, NOT on the event
+        ctf_condition_id = market.get("conditionId", "")
+        gamma_event_id = event.get("id", "")
+
+        if not ctf_condition_id:
+            logger.warning(
+                "Market %s has no conditionId — redemption will fail", slug
+            )
+
         return MarketWindow(
-            condition_id=event.get("id", ""),
+            condition_id=ctf_condition_id,       # On-chain CTF ID for redeem()
             question=question,
             up_token_id=token_ids[0],
             down_token_id=token_ids[1],
             end_time=end_date,
             end_time_epoch=self._parse_iso_to_epoch(end_date),
             slug=slug,
+            event_id=gamma_event_id,             # Gamma event ID for resolution checks
         )
 
     def _parse_token_ids(self, raw: str) -> list[str]:

@@ -191,10 +191,13 @@ class OrderManager:
             return leg.state
 
     async def _check_live_resolution(self, condition_id: str) -> bool:
-        """Query Gamma API to check if market/event has resolved."""
+        """Query Gamma API to check if market/event has resolved.
+
+        NOTE: Despite the parameter name, the caller now passes the Gamma
+        event_id here (not the CTF condition_id). The CTF condition_id is
+        used only for the actual redeem() call.
+        """
         try:
-            # Use Gamma API directly to check event status
-            # The condition_id is actually the event ID
             response = await self._http_client.get(f"/events?id={condition_id}")
             response.raise_for_status()
             events = response.json()
