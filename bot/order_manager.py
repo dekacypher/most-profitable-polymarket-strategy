@@ -219,27 +219,97 @@ class OrderManager:
             return False
 
     async def _redeem_live(self, condition_id: str) -> tuple[bool, str]:
-        """Call the CLOB/CTF redeem endpoint for a resolved market.
+        """Redeem resolved positions on-chain via the CTF contract.
 
-        On Polymarket, redeeming a complete set on a resolved binary
-        market returns $1.00 per share. If the account is blacklisted
-        (e.g., OFAC sanctions), this call will fail.
+        Calls ConditionalTokens.redeemPositions() on Polygon to convert
+        winning outcome tokens back to USDC after market resolution.
         """
         try:
-            result = await asyncio.to_thread(
-                self._clob_client.redeem, condition_id
+            success = await asyncio.to_thread(
+                self._redeem_on_chain, condition_id
             )
-            success = result.get("success", False)
             if success:
-                logger.info("Redeemed condition %s", condition_id[:8])
+                logger.info("Redeemed condition %s on-chain", condition_id[:8])
                 return True, ""
-            error = result.get("error", "Unknown redemption error")
-            logger.warning("Redeem failed for %s: %s", condition_id[:8], error)
-            return False, str(error)
+            return False, "Transaction failed or reverted"
         except Exception as exc:
             error_msg = str(exc)
             logger.exception("Redeem exception for %s", condition_id[:8])
             return False, error_msg
+
+    def _redeem_on_chain(self, condition_id: str) -> bool:
+        """Execute the on-chain redeemPositions call."""
+        from web3 import Web3
+        from eth_account import Account
+
+        rpc_url = "https://polygon-bor-rpc.publicnode.com"
+        w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 30}))
+
+        if not w3.is_connected():
+            raise ConnectionError("Cannot connect to Polygon RPC")
+
+        private_key = self._config.private_key
+        account = Account.from_key(private_key)
+        wallet = account.address
+
+        # CTF ConditionalTokens contract on Polygon
+        ctf_address = Web3.to_checksum_address(
+            "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+        )
+        # USDC.e collateral on Polygon
+        collateral = Web3.to_checksum_address(
+            "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        )
+
+        # redeemPositions ABI
+        ctf_abi = [
+            {
+                "name": "redeemPositions",
+                "type": "function",
+                "inputs": [
+                    {"name": "collateralToken", "type": "address"},
+                    {"name": "parentCollectionId", "type": "bytes32"},
+                    {"name": "conditionId", "type": "bytes32"},
+                    {"name": "indexSets", "type": "uint256[]"},
+                ],
+                "outputs": [],
+            }
+        ]
+
+        ctf = w3.eth.contract(address=ctf_address, abi=ctf_abi)
+
+        # Convert condition_id to bytes32
+        condition_bytes = bytes.fromhex(condition_id.replace("0x", ""))
+        parent_collection = b"\x00" * 32  # root collection
+
+        # Binary market: index sets [1, 2] (outcome 0 and outcome 1)
+        index_sets = [1, 2]
+
+        tx = ctf.functions.redeemPositions(
+            collateral,
+            parent_collection,
+            condition_bytes,
+            index_sets,
+        ).build_transaction({
+            "from": wallet,
+            "nonce": w3.eth.get_transaction_count(wallet),
+            "gas": 300_000,
+            "gasPrice": w3.eth.gas_price,
+            "chainId": 137,
+        })
+
+        signed = w3.eth.account.sign_transaction(tx, private_key)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+
+        success = receipt["status"] == 1
+        logger.info(
+            "Redeem tx %s — status: %s, gas: %d",
+            tx_hash.hex()[:16],
+            "SUCCESS" if success else "REVERTED",
+            receipt["gasUsed"],
+        )
+        return success
 
     def _build_clob_client(self) -> object:
         """Construct a py-clob-client ClobClient instance."""

@@ -56,6 +56,7 @@ class BotEngine:
 
         await self._start_components()
         await self._telegram.start()
+        self._risk.deactivate_kill_switch()
         self._running = True
         await self._telegram.send(f"*BOT STARTED* ({mode} mode)")
 
