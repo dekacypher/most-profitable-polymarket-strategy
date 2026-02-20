@@ -81,12 +81,18 @@ class PositionTracker:
         self._finalize(target)
 
     def mark_awaiting_resolution(self, set_id: str) -> None:
-        """Transition COMPLETE → AWAITING_RESOLUTION when window ends."""
+        """Transition to AWAITING_RESOLUTION when window ends.
+
+        Works for both COMPLETE sets (both legs filled) and
+        ONE_LEG_FILLED sets (holding single leg for redemption).
+        """
         target = self._find_active(set_id)
         if not target:
             return
-        if target.state == SetState.COMPLETE:
+        if target.state in (SetState.COMPLETE, SetState.ONE_LEG_FILLED):
             target.state = SetState.AWAITING_RESOLUTION
+            if not target.completed_at:
+                target.completed_at = time.time()
             logger.info("Set %s now awaiting resolution", set_id)
 
     def mark_redeemed(self, set_id: str) -> None:
