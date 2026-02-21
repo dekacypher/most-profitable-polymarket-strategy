@@ -442,6 +442,33 @@ class BotEngine:
         aggressive_price = min(tob.best_bid + 2 * tick, tob.best_ask - tick)
         aggressive_price = round(int(aggressive_price / tick) * tick, 4)
 
+        # Hard ceiling: combined cost must stay below $1.00 - min_edge.
+        # Without this cap, chasing a rising unfilled leg turns a profitable
+        # complete set into a guaranteed loss (e.g. UP@0.45 + DN@0.58 = $1.03).
+        filled = cs.filled_leg()
+        if filled:
+            min_edge = self._config.min_edge_cents / 100.0
+            max_price = round(
+                int((1.0 - filled.price - min_edge) / tick) * tick, 4
+            )
+            if aggressive_price > max_price:
+                if max_price <= 0:
+                    # No profitable price exists — stop chasing, hold for resolution
+                    logger.info(
+                        "Set %s: unfilled %s leg too expensive to repost profitably "
+                        "(filled=%s@%.2f, market=%.2f) — holding for resolution",
+                        cs.set_id, unfilled.side.value,
+                        filled.side.value, filled.price, tob.best_bid,
+                    )
+                    await self._hold_filled_leg(cs)
+                    return
+                logger.info(
+                    "Set %s: capping %s repost at %.2f (market %.2f would make combined >$%.2f)",
+                    cs.set_id, unfilled.side.value, max_price, aggressive_price,
+                    filled.price + aggressive_price,
+                )
+                aggressive_price = max_price
+
         new_leg = await self._order_manager.place_maker_bid(
             token_id=unfilled.token_id,
             side=unfilled.side,
