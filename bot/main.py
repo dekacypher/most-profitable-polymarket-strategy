@@ -81,6 +81,10 @@ def configure_logging(verbose: bool, log_dir: str) -> None:
         handlers=handlers,
     )
 
+    # Silence noisy HTTP libraries — only show warnings/errors
+    for noisy in ("httpcore", "httpx", "urllib3", "asyncio"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
 
 def main() -> None:
     parser = build_parser()

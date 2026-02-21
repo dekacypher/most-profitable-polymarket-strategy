@@ -56,6 +56,7 @@ class BotEngine:
 
         await self._start_components()
         await self._telegram.start()
+        self._risk.deactivate_kill_switch()
         self._running = True
         await self._telegram.send(f"*BOT STARTED* ({mode} mode)")
 
@@ -275,8 +276,7 @@ class BotEngine:
             → deadline exceeded: flag for manual review
         """
         for cs in self._tracker.active_sets:
-            if cs.state == SetState.COMPLETE:
-                logger.info(f"Checking transition to awaiting resolution for set {cs.set_id}")
+            if cs.state in (SetState.COMPLETE, SetState.ONE_LEG_FILLED):
                 await self._check_transition_to_awaiting(cs)
 
             elif cs.state == SetState.AWAITING_RESOLUTION:
@@ -346,7 +346,7 @@ class BotEngine:
 
         if success:
             self._risk.record_redemption_success()
-            pnl = cs.edge_per_share * cs.up_leg.size
+            pnl = self._calculate_redemption_pnl(cs)
             self._tracker.mark_redeemed(cs.set_id)
             self._risk.record_pnl(pnl)
             logger.info(
@@ -372,7 +372,15 @@ class BotEngine:
     # ── One-leg management ─────────────────────────────────────────
 
     async def _manage_one_leg_sets(self) -> None:
-        """For sets with one leg filled: aggressively re-quote or abandon."""
+        """For sets with one leg filled: keep re-quoting, never abandon.
+
+        Instead of abandoning after a timeout, we hold the filled leg
+        through resolution. A single filled leg at $0.02 is worth $1.00
+        if the market resolves in its favour — abandoning throws that away.
+        When the timeout expires we cancel the unfilled leg and transition
+        the set straight to AWAITING_RESOLUTION so the redemption monitor
+        picks it up.
+        """
         for cs in self._tracker.active_sets:
             if cs.state != SetState.ONE_LEG_FILLED:
                 continue
@@ -385,7 +393,7 @@ class BotEngine:
             elapsed = time.time() - (cs.filled_leg().filled_at or cs.created_at)
 
             if elapsed > timeout:
-                await self._abandon_set(cs)
+                await self._hold_filled_leg(cs)
                 continue
 
             # Re-quote the unfilled leg more aggressively
@@ -424,24 +432,54 @@ class BotEngine:
             unfilled.side.value, aggressive_price, cs.set_id,
         )
 
-    async def _abandon_set(self, cs: CompleteSet) -> None:
-        """Abandon a one-leg set: cancel the unfilled leg, book the loss."""
+    async def _hold_filled_leg(self, cs: CompleteSet) -> None:
+        """Cancel the unfilled leg and hold the filled leg for redemption.
+
+        The filled token is still in the wallet — if the market resolves
+        in its favour, it pays $1.00 per share.  We transition the set to
+        AWAITING_RESOLUTION so the redemption loop picks it up.
+        """
         unfilled = cs.unfilled_leg()
         if unfilled and unfilled.state == OrderState.LIVE:
             await self._order_manager.cancel_order(unfilled.order_id)
 
         filled = cs.filled_leg()
-        loss = -(filled.price * filled.size) if filled else 0.0
+        cost = filled.price * filled.size if filled else 0.0
 
-        self._tracker.mark_abandoned(cs.set_id, loss)
-        self._risk.record_pnl(loss)
-
-        logger.warning(
-            "Abandoned set %s — loss $%.4f", cs.set_id, abs(loss),
+        self._tracker.mark_awaiting_resolution(cs.set_id)
+        logger.info(
+            "Holding filled %s leg for set %s (cost $%.4f) — awaiting resolution",
+            filled.side.value if filled else "?",
+            cs.set_id,
+            cost,
         )
-        await self._telegram.notify_abandoned(cs.set_id, loss)
+        await self._telegram.send(
+            f"Holding filled leg for set {cs.set_id} — awaiting resolution"
+        )
 
     # ── Helpers ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _calculate_redemption_pnl(cs: CompleteSet) -> float:
+        """Calculate PnL for a redeemed set.
+
+        Complete set (both legs): redemption pays $1.00 per share,
+        cost is combined price of both legs.
+        Single-leg hold: the winning token pays $1.00 per share,
+        cost is just the filled leg's price.
+        """
+        both_filled = (
+            cs.up_leg and cs.up_leg.state == OrderState.FILLED
+            and cs.down_leg and cs.down_leg.state == OrderState.FILLED
+        )
+        if both_filled:
+            cost_per_share = cs.up_leg.price + cs.down_leg.price
+            return (1.0 - cost_per_share) * cs.up_leg.size
+
+        filled = cs.filled_leg()
+        if filled:
+            return (1.0 - filled.price) * filled.size
+        return 0.0
 
     def _find_set(self, set_id: str) -> CompleteSet | None:
         for cs in self._tracker.active_sets:
