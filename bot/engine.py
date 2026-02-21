@@ -329,18 +329,17 @@ class BotEngine:
                 deadline,
             )
 
-        # Check if market has actually resolved on-chain (use event_id for Gamma API)
-        event_id = cs.window.event_id or cs.window.condition_id
-        resolved = await self._order_manager.check_market_resolved(event_id)
-        if not resolved:
-            return
-
-        # Attempt redemption (use condition_id — the actual on-chain CTF condition ID)
+        # Both resolution check and redemption use the CTF condition_id (bytes32).
+        # event_id is a Gamma integer and cannot be used with payoutDenominator.
         condition_id = cs.window.condition_id
         if not condition_id:
             logger.error(
                 "Set %s has no CTF condition_id — cannot redeem!", cs.set_id
             )
+            return
+
+        resolved = await self._order_manager.check_market_resolved(condition_id)
+        if not resolved:
             return
         success, error = await self._order_manager.redeem_complete_set(condition_id)
 
