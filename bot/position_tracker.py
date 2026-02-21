@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 from bot.config import BotConfig
-from bot.types import CompleteSet, OrderState, SetState
+from bot.types import CompleteSet, LegOrder, MarketWindow, OrderState, SetState, TokenSide
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,7 @@ class PositionTracker:
         self._completed: list[CompleteSet] = []
         self._log_path = Path(config.trade_log_file)
         self._log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.load()
 
     @property
     def active_sets(self) -> list[CompleteSet]:
@@ -159,6 +160,81 @@ class PositionTracker:
             ),
         }
 
+    def load(self) -> None:
+        """Restore active sets from the trade log on startup.
+
+        Rebuilds COMPLETE, ONE_LEG_FILLED, and AWAITING_RESOLUTION sets so the
+        redemption monitor picks them up immediately after a restart. Completed
+        sets (REDEEMED, ABANDONED, REDEMPTION_FAILED) are loaded into history.
+        """
+        if not self._log_path.exists():
+            return
+
+        try:
+            records = json.loads(self._log_path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.exception("Failed to read %s — starting fresh", self._log_path)
+            return
+
+        active_states = {
+            SetState.COMPLETE,
+            SetState.ONE_LEG_FILLED,
+            SetState.AWAITING_RESOLUTION,
+        }
+        restored = 0
+
+        for rec in records:
+            try:
+                state_name = rec.get("state", "")
+                try:
+                    state = SetState[state_name]
+                except KeyError:
+                    continue
+
+                # Reconstruct window — condition_id is the critical field
+                condition_id = rec.get("condition_id") or rec.get("window_id", "")
+                window = MarketWindow(
+                    condition_id=condition_id,
+                    question=rec.get("question", ""),
+                    up_token_id=rec.get("up_token_id", ""),
+                    down_token_id=rec.get("down_token_id", ""),
+                    end_time=rec.get("end_time", ""),
+                    end_time_epoch=float(rec.get("end_time_epoch", 0.0)),
+                    slug=rec.get("slug"),
+                    event_id=rec.get("event_id", ""),
+                )
+
+                up_leg = _leg_from_dict(rec.get("up_leg"))
+                down_leg = _leg_from_dict(rec.get("down_leg"))
+
+                cs = CompleteSet(
+                    set_id=rec["set_id"],
+                    window=window,
+                    up_leg=up_leg,
+                    down_leg=down_leg,
+                    state=state,
+                    created_at=float(rec.get("created_at", time.time())),
+                    completed_at=rec.get("completed_at"),
+                    pnl=rec.get("pnl"),
+                    redemption_attempts=int(rec.get("redemption_attempts", 0)),
+                    last_redemption_error=rec.get("last_redemption_error"),
+                )
+
+                if state in active_states:
+                    self._active.append(cs)
+                    restored += 1
+                else:
+                    self._completed.append(cs)
+
+            except Exception:
+                logger.exception("Failed to restore set %s — skipping", rec.get("set_id"))
+
+        if restored:
+            logger.info(
+                "Restored %d active set(s) from %s — redemption will resume",
+                restored, self._log_path,
+            )
+
     def persist(self) -> None:
         """Write all trade records to JSON."""
         all_sets = self._completed + self._active
@@ -213,4 +289,24 @@ class PositionTracker:
             return target.up_leg
         if target.down_leg and target.down_leg.token_id == token_id:
             return target.down_leg
+        return None
+
+
+def _leg_from_dict(d: dict | None) -> LegOrder | None:
+    """Reconstruct a LegOrder from a persisted dict."""
+    if not d:
+        return None
+    try:
+        return LegOrder(
+            order_id=d["order_id"],
+            token_id=d["token_id"],
+            side=TokenSide(d["side"]),
+            price=float(d["price"]),
+            size=float(d["size"]),
+            state=OrderState[d["state"]],
+            placed_at=float(d.get("placed_at", time.time())),
+            filled_at=d.get("filled_at"),
+        )
+    except Exception:
+        logger.warning("Could not reconstruct leg from %s", d)
         return None
