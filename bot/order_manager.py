@@ -2,6 +2,9 @@
 
 In paper mode: generates fake order IDs, simulates fills with 15% probability.
 In live mode: wraps the synchronous py-clob-client in asyncio.to_thread().
+
+Redemption uses direct on-chain CTF contract calls (not the CLOB API, which
+has no redeem endpoint).
 """
 
 from __future__ import annotations
@@ -14,11 +17,56 @@ import uuid
 from typing import Optional
 
 import httpx
+from eth_account import Account
+from web3 import Web3
 
 from bot.config import BotConfig
 from bot.types import LegOrder, OrderState, TokenSide
 
 logger = logging.getLogger(__name__)
+
+# ── On-chain constants for Polygon mainnet ──────────────────────────
+USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+CONDITIONAL_TOKENS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+
+POLYGON_RPCS = [
+    "https://polygon.llamarpc.com",
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://polygon-rpc.com",
+    "https://rpc.ankr.com/polygon",
+]
+
+CT_ABI = [
+    {
+        "inputs": [
+            {"name": "collateralToken", "type": "address"},
+            {"name": "parentCollectionId", "type": "bytes32"},
+            {"name": "conditionId", "type": "bytes32"},
+            {"name": "indexSets", "type": "uint256[]"},
+        ],
+        "name": "redeemPositions",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"name": "account", "type": "address"},
+            {"name": "id", "type": "uint256"},
+        ],
+        "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [{"name": "conditionId", "type": "bytes32"}],
+        "name": "payoutDenominator",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+]
 
 
 class OrderManager:
@@ -28,9 +76,13 @@ class OrderManager:
         self._config = config
         self._clob_client: Optional[object] = None
         self._http_client: Optional[httpx.AsyncClient] = None
+        # Web3 / on-chain redemption
+        self._w3: Optional[Web3] = None
+        self._account = None
+        self._ct_contract = None
 
     async def start(self) -> None:
-        """Initialize the CLOB client for live trading."""
+        """Initialize the CLOB client and Web3 for live trading."""
         if not self._config.live:
             logger.info("Paper mode — no CLOB client needed")
             return
@@ -41,6 +93,46 @@ class OrderManager:
             timeout=10.0,
         )
         logger.info("CLOB client initialized for live trading")
+
+        # Set up Web3 for on-chain redemption
+        self._setup_web3()
+
+    def _setup_web3(self) -> None:
+        """Connect to Polygon RPC and prepare CTF contract for redemption."""
+        pk = self._config.private_key
+        if not pk:
+            logger.warning("No private key — on-chain redemption disabled")
+            return
+
+        if not pk.startswith("0x"):
+            pk = "0x" + pk
+        self._account = Account.from_key(pk)
+
+        # Use reliable public RPCs first, then configured RPC as extra fallback
+        rpcs = list(POLYGON_RPCS)
+        if self._config.polygon_rpc_url:
+            rpcs.append(self._config.polygon_rpc_url)
+
+        for rpc in rpcs:
+            if not rpc:
+                continue
+            try:
+                w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 30}))
+                if w3.is_connected():
+                    self._w3 = w3
+                    self._ct_contract = w3.eth.contract(
+                        address=Web3.to_checksum_address(CONDITIONAL_TOKENS),
+                        abi=CT_ABI,
+                    )
+                    logger.info(
+                        "Web3 connected to %s — wallet %s",
+                        rpc[:40], self._account.address,
+                    )
+                    return
+            except Exception:
+                continue
+
+        logger.error("Could not connect to any Polygon RPC — redemption disabled!")
 
     async def stop(self) -> None:
         if self._http_client:
@@ -191,55 +283,233 @@ class OrderManager:
             return leg.state
 
     async def _check_live_resolution(self, condition_id: str) -> bool:
-        """Query Gamma API to check if market/event has resolved.
+        """Check on-chain if the CTF oracle has settled this condition.
 
-        NOTE: Despite the parameter name, the caller now passes the Gamma
-        event_id here (not the CTF condition_id). The CTF condition_id is
-        used only for the actual redeem() call.
+        Uses payoutDenominator > 0 as the authoritative signal — this is
+        the only safe gate before calling redeemPositions.
         """
-        try:
-            response = await self._http_client.get(f"/events?id={condition_id}")
-            response.raise_for_status()
-            events = response.json()
-
-            if not events or len(events) == 0:
-                logger.debug("Event %s not found", condition_id[:8])
-                return False
-
-            event = events[0]
-            # Check if event is closed (resolved)
-            is_closed = event.get("closed", False)
-            if is_closed:
-                logger.info("Event %s (%s) resolved/closed",
-                           condition_id[:8], event.get("slug", ""))
-
-            return bool(is_closed)
-        except Exception as exc:
-            logger.debug("Resolution check failed for %s: %s", condition_id[:8], str(exc))
-            return False
+        return await asyncio.to_thread(self._check_payouts_set, condition_id)
 
     async def _redeem_live(self, condition_id: str) -> tuple[bool, str]:
-        """Call the CLOB/CTF redeem endpoint for a resolved market.
+        """Redeem winning tokens on-chain via the CTF contract.
 
-        On Polymarket, redeeming a complete set on a resolved binary
-        market returns $1.00 per share. If the account is blacklisted
-        (e.g., OFAC sanctions), this call will fail.
+        Calls redeemPositions on the Conditional Tokens contract directly.
+        Index sets [1, 2] covers both outcomes — the contract only burns
+        tokens the wallet actually holds.
         """
+        if not self._w3 or not self._account or not self._ct_contract:
+            return False, "Web3 not initialized — cannot redeem on-chain"
+
         try:
-            result = await asyncio.to_thread(
-                self._clob_client.redeem, condition_id
+            return await asyncio.to_thread(
+                self._redeem_onchain_sync, condition_id
             )
-            success = result.get("success", False)
-            if success:
-                logger.info("Redeemed condition %s", condition_id[:8])
-                return True, ""
-            error = result.get("error", "Unknown redemption error")
-            logger.warning("Redeem failed for %s: %s", condition_id[:8], error)
-            return False, str(error)
         except Exception as exc:
             error_msg = str(exc)
             logger.exception("Redeem exception for %s", condition_id[:8])
             return False, error_msg
+
+    def _get_working_w3(self) -> tuple[Web3, object]:
+        """Return a connected Web3 instance + CT contract, with RPC fallback."""
+        if self._w3 and self._w3.is_connected():
+            return self._w3, self._ct_contract
+
+        logger.warning("Primary RPC disconnected — trying fallbacks")
+        rpcs = list(POLYGON_RPCS)
+        if self._config.polygon_rpc_url:
+            rpcs.append(self._config.polygon_rpc_url)
+
+        for rpc in rpcs:
+            if not rpc:
+                continue
+            try:
+                w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 30}))
+                if w3.is_connected():
+                    ct = w3.eth.contract(
+                        address=Web3.to_checksum_address(CONDITIONAL_TOKENS),
+                        abi=CT_ABI,
+                    )
+                    self._w3 = w3
+                    self._ct_contract = ct
+                    logger.info("Switched RPC to %s", rpc[:40])
+                    return w3, ct
+            except Exception:
+                continue
+
+        raise RuntimeError("All Polygon RPCs are down")
+
+    def _verify_receipt_has_payout(self, receipt: dict) -> bool:
+        """Check that the TX receipt contains an actual USDC.e transfer.
+
+        CRITICAL: A no-op redeemPositions can confirm with status=1 and
+        emit log events (ERC-1155 token burn + Polygon MATIC fee) but
+        transfer ZERO USDC.e when payouts haven't been set by the oracle.
+
+        We specifically look for a log from the USDC.e contract address
+        which indicates an actual collateral payout occurred.
+        """
+        logs = receipt.get("logs", [])
+        if len(logs) == 0:
+            return False
+
+        usdc_address = USDC_E.lower()
+        for log in logs:
+            log_addr = getattr(log, "address", "") or log.get("address", "")
+            if log_addr.lower() == usdc_address:
+                return True
+
+        logger.warning(
+            "TX confirmed with %d logs but NO USDC.e transfer — "
+            "oracle may not have reported payouts yet",
+            len(logs),
+        )
+        return False
+
+    def _check_payouts_set(self, condition_id: str) -> bool:
+        """Check on-chain if the UMA oracle has reported payouts for this condition.
+
+        CRITICAL SAFETY CHECK: If payoutDenominator == 0, the market has NOT
+        been resolved. Calling redeemPositions in this state burns tokens
+        with ZERO payout. We MUST wait until payoutDenominator > 0.
+        """
+        try:
+            w3, ct = self._get_working_w3()
+            condition_id_bytes = bytes.fromhex(condition_id.replace("0x", ""))
+            denominator = ct.functions.payoutDenominator(condition_id_bytes).call()
+            if denominator == 0:
+                logger.info(
+                    "Condition %s: payoutDenominator=0 — NOT resolved on-chain yet",
+                    condition_id[:12],
+                )
+                return False
+            logger.info(
+                "Condition %s: payoutDenominator=%d — resolved on-chain!",
+                condition_id[:12], denominator,
+            )
+            return True
+        except Exception as e:
+            logger.warning("Failed to check payoutDenominator for %s: %s", condition_id[:12], e)
+            return False
+
+    def _redeem_onchain_sync(self, condition_id: str) -> tuple[bool, str]:
+        """Synchronous on-chain redemption (runs in thread) with RPC fallback."""
+        wallet = self._account.address
+
+        # CRITICAL: Check if payouts are set BEFORE attempting redemption
+        if not self._check_payouts_set(condition_id):
+            return False, "Payouts not set on-chain yet — oracle has not resolved"
+
+        condition_id_bytes = bytes.fromhex(condition_id.replace("0x", ""))
+        parent_collection = bytes(32)
+        index_sets = [1, 2]
+
+        max_rpc_attempts = 3
+        for rpc_attempt in range(max_rpc_attempts):
+            try:
+                w3, ct = self._get_working_w3()
+
+                nonce = w3.eth.get_transaction_count(wallet, "pending")
+                base_gas_price = w3.eth.gas_price
+                gas_price = int(base_gas_price * 1.2)
+
+                tx = ct.functions.redeemPositions(
+                    Web3.to_checksum_address(USDC_E),
+                    parent_collection,
+                    condition_id_bytes,
+                    index_sets,
+                ).build_transaction({
+                    "from": wallet,
+                    "nonce": nonce,
+                    "gas": 300_000,
+                    "gasPrice": gas_price,
+                    "chainId": 137,
+                })
+
+                signed = self._account.sign_transaction(tx)
+
+                max_retries = 3
+                for retry in range(max_retries):
+                    try:
+                        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                        logger.info(
+                            "Redeem TX sent for %s — hash %s (attempt %d)",
+                            condition_id[:12], tx_hash.hex(), retry + 1,
+                        )
+
+                        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
+
+                        if receipt["status"] == 1:
+                            if self._verify_receipt_has_payout(receipt):
+                                logger.info(
+                                    "Redeemed condition %s — TX confirmed with %d log events",
+                                    condition_id[:12], len(receipt.get("logs", [])),
+                                )
+                                return True, ""
+                            else:
+                                logger.warning(
+                                    "TX confirmed for %s but ZERO log events — no-op "
+                                    "(wrong condition_id or no tokens held)",
+                                    condition_id[:12],
+                                )
+                                return False, "TX confirmed but no tokens redeemed (no-op)"
+                        else:
+                            return False, "Transaction reverted on-chain"
+
+                    except Exception as send_error:
+                        err = str(send_error).lower()
+                        if "replacement transaction underpriced" in err:
+                            gas_price = int(gas_price * 1.5)
+                            tx["gasPrice"] = gas_price
+                            signed = self._account.sign_transaction(tx)
+                            logger.warning(
+                                "Pending TX conflict — bumping gas to %.1f gwei",
+                                gas_price / 1e9,
+                            )
+                            time.sleep(2)
+                            continue
+                        elif "nonce too low" in err:
+                            return False, "Nonce too low — TX may already be processed"
+                        elif "already known" in err:
+                            logger.info(
+                                "TX already in mempool for %s — waiting for receipt",
+                                condition_id[:12],
+                            )
+                            try:
+                                receipt = w3.eth.wait_for_transaction_receipt(
+                                    w3.keccak(signed.raw_transaction), timeout=90
+                                )
+                                if receipt["status"] == 1:
+                                    if self._verify_receipt_has_payout(receipt):
+                                        return True, ""
+                                    else:
+                                        return False, "TX confirmed but no tokens redeemed (no-op)"
+                                else:
+                                    return False, "Transaction reverted on-chain"
+                            except Exception:
+                                return False, "already known — receipt wait timed out"
+                        else:
+                            raise
+
+                return False, "Max retries exceeded"
+
+            except Exception as rpc_error:
+                err_msg = str(rpc_error)
+                is_rpc_down = any(p in err_msg.lower() for p in [
+                    "503", "502", "server error", "service unavailable",
+                    "connection", "timeout", "eof", "reset by peer",
+                ])
+                if is_rpc_down and rpc_attempt < max_rpc_attempts - 1:
+                    logger.warning(
+                        "RPC error on attempt %d: %s — switching RPC",
+                        rpc_attempt + 1, err_msg[:80],
+                    )
+                    self._w3 = None  # force reconnect on next _get_working_w3
+                    time.sleep(1)
+                    continue
+                else:
+                    raise
+
+        return False, "All RPC attempts failed"
 
     def _build_clob_client(self) -> object:
         """Construct a py-clob-client ClobClient instance."""
@@ -266,12 +536,18 @@ class OrderManager:
 
 
 def _map_clob_status(status: str) -> OrderState:
-    """Map CLOB API status string to our OrderState enum."""
+    """Map CLOB API status string to our OrderState enum.
+
+    Polymarket CLOB statuses include: LIVE, MATCHED, CLOSED, CANCELLED, EXPIRED.
+    CLOSED means the order is done — could be fully matched or expired.
+    """
     mapping = {
         "LIVE": OrderState.LIVE,
+        "OPEN": OrderState.LIVE,
         "ACTIVE": OrderState.LIVE,
         "MATCHED": OrderState.FILLED,
         "FILLED": OrderState.FILLED,
+        "CLOSED": OrderState.FILLED,       # CLOSED = done; check size_matched to confirm
         "CANCELLED": OrderState.CANCELLED,
         "CANCELED": OrderState.CANCELLED,
         "EXPIRED": OrderState.EXPIRED,

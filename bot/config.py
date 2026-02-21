@@ -29,6 +29,7 @@ class BotConfig:
     clob_url: str = "https://clob.polymarket.com"
     gamma_url: str = "https://gamma-api.polymarket.com"
     ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    polygon_rpc_url: str = ""  # Polygon RPC for on-chain redemption (fallbacks built-in)
 
     # --- Strategy parameters ---
     min_edge_cents: float = 2.0        # Minimum edge in cents (combined < $0.98)
@@ -93,6 +94,7 @@ def load_config(env_path: str = ".env", live: bool = False) -> BotConfig:
             "POLYMARKET_WS_URL",
             "wss://ws-subscriptions-clob.polymarket.com/ws/market",
         ),
+        polygon_rpc_url=os.getenv("POLYGON_RPC_URL", ""),
         min_edge_cents=float(os.getenv("BOT_MIN_EDGE_CENTS", "2.0")),
         bid_improve_cents=float(os.getenv("BOT_BID_IMPROVE_CENTS", "1.0")),
         default_size=float(os.getenv("BOT_DEFAULT_SIZE", "5.0")),
