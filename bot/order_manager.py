@@ -26,7 +26,9 @@ from bot.types import LegOrder, OrderState, TokenSide
 logger = logging.getLogger(__name__)
 
 # ── On-chain constants for Polygon mainnet ──────────────────────────
-USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+USDC_NATIVE = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"   # Native USDC (Polymarket current, post-2024)
+USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"        # Bridged USDC.e (legacy pre-2024 markets)
+USDC_COLLATERALS = [USDC_NATIVE, USDC_E]                      # Try native first
 CONDITIONAL_TOKENS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 
 POLYGON_RPCS = [
@@ -352,15 +354,15 @@ class OrderManager:
         if len(logs) == 0:
             return False
 
-        usdc_address = USDC_E.lower()
+        usdc_addresses = {addr.lower() for addr in USDC_COLLATERALS}
         for log in logs:
             log_addr = getattr(log, "address", "") or log.get("address", "")
-            if log_addr.lower() == usdc_address:
+            if log_addr.lower() in usdc_addresses:
                 return True
 
         logger.warning(
-            "TX confirmed with %d logs but NO USDC.e transfer — "
-            "oracle may not have reported payouts yet",
+            "TX confirmed with %d logs but NO USDC transfer — "
+            "checked native USDC and USDC.e; wrong collection or no tokens held",
             len(logs),
         )
         return False
@@ -392,13 +394,34 @@ class OrderManager:
             return False
 
     def _redeem_onchain_sync(self, condition_id: str) -> tuple[bool, str]:
-        """Synchronous on-chain redemption (runs in thread) with RPC fallback."""
-        wallet = self._account.address
+        """Synchronous on-chain redemption — tries native USDC then USDC.e (legacy).
 
+        Polymarket migrated from USDC.e to native USDC in 2024.  All current
+        markets use native USDC as collateral, so we try that first.  We fall
+        back to USDC.e for any positions minted before the migration.
+        """
         # CRITICAL: Check if payouts are set BEFORE attempting redemption
         if not self._check_payouts_set(condition_id):
             return False, "Payouts not set on-chain yet — oracle has not resolved"
 
+        for usdc_addr in USDC_COLLATERALS:
+            success, err = self._submit_redeem_tx(condition_id, usdc_addr)
+            if success:
+                return True, ""
+            if "no tokens redeemed" in err:
+                logger.info(
+                    "No positions for %s in %s collection — trying next collateral",
+                    condition_id[:12], usdc_addr[:10],
+                )
+                continue
+            # Real error (reverted, RPC down, etc.) — don't try next address
+            return False, err
+
+        return False, "No positions found in native USDC or USDC.e collection — may already be redeemed"
+
+    def _submit_redeem_tx(self, condition_id: str, usdc_addr: str) -> tuple[bool, str]:
+        """Submit a single redeemPositions TX for the given collateral address."""
+        wallet = self._account.address
         condition_id_bytes = bytes.fromhex(condition_id.replace("0x", ""))
         parent_collection = bytes(32)
         index_sets = [1, 2]
@@ -413,7 +436,7 @@ class OrderManager:
                 gas_price = int(base_gas_price * 1.2)
 
                 tx = ct.functions.redeemPositions(
-                    Web3.to_checksum_address(USDC_E),
+                    Web3.to_checksum_address(usdc_addr),
                     parent_collection,
                     condition_id_bytes,
                     index_sets,
@@ -432,8 +455,8 @@ class OrderManager:
                     try:
                         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
                         logger.info(
-                            "Redeem TX sent for %s — hash %s (attempt %d)",
-                            condition_id[:12], tx_hash.hex(), retry + 1,
+                            "Redeem TX sent for %s [%s] — hash %s (attempt %d)",
+                            condition_id[:12], usdc_addr[:10], tx_hash.hex(), retry + 1,
                         )
 
                         receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
@@ -441,16 +464,11 @@ class OrderManager:
                         if receipt["status"] == 1:
                             if self._verify_receipt_has_payout(receipt):
                                 logger.info(
-                                    "Redeemed condition %s — TX confirmed with %d log events",
-                                    condition_id[:12], len(receipt.get("logs", [])),
+                                    "Redeemed condition %s (collateral %s) — TX confirmed with %d log events",
+                                    condition_id[:12], usdc_addr[:10], len(receipt.get("logs", [])),
                                 )
                                 return True, ""
                             else:
-                                logger.warning(
-                                    "TX confirmed for %s but ZERO log events — no-op "
-                                    "(wrong condition_id or no tokens held)",
-                                    condition_id[:12],
-                                )
                                 return False, "TX confirmed but no tokens redeemed (no-op)"
                         else:
                             return False, "Transaction reverted on-chain"
