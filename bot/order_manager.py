@@ -32,6 +32,7 @@ USDC_COLLATERALS = [USDC_NATIVE, USDC_E]                      # Try native first
 CONDITIONAL_TOKENS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 
 POLYGON_RPCS = [
+    "https://polygon-mainnet.g.alchemy.com/v2/fWuuT1kth0pGMUR6_fs9-",  # Alchemy (fastest)
     "https://polygon.llamarpc.com",
     "https://polygon-bor-rpc.publicnode.com",
     "https://polygon-rpc.com",

@@ -83,8 +83,12 @@ def _parse_book_response(token_id: str, data: dict) -> Optional[TopOfBook]:
     if not bids or not asks:
         return None
 
-    best_bid_entry = bids[0]
-    best_ask_entry = asks[0]
+    # Polymarket CLOB returns bids ASCENDING (lowest price first) and
+    # asks DESCENDING (highest price first). Best bid = bids[-1] (highest);
+    # best ask = asks[-1] (lowest). Using bids[0]/asks[0] gives the worst
+    # prices at the bottom of the book, causing all quotes to be far off-market.
+    best_bid_entry = bids[-1]
+    best_ask_entry = asks[-1]
 
     best_bid = float(best_bid_entry.get("price", 0))
     bid_size = float(best_bid_entry.get("size", 0))
