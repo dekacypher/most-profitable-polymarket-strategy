@@ -48,6 +48,9 @@ class BotEngine:
         self._quoted_windows: set[str] = set()
         self._running = False
         self._last_scan_log: float = 0
+        # Per-condition_id timestamps of last payoutDenominator check.
+        # Prevents hammering the RPC every second for unresolved conditions.
+        self._redemption_check_times: dict[str, float] = {}
 
     async def run(self) -> None:
         """Start all components and run the main loops."""
@@ -280,11 +283,11 @@ class BotEngine:
                 await self._check_transition_to_awaiting(cs)
 
             elif cs.state == SetState.AWAITING_RESOLUTION:
-                logger.info(f"Attempting redemption for set {cs.set_id}")
+                logger.debug("Checking redemption for set %s", cs.set_id)
                 try:
                     await self._attempt_redemption(cs)
                 except Exception:
-                    logger.exception(f"Error attempting redemption for set {cs.set_id}")
+                    logger.exception("Error attempting redemption for set %s", cs.set_id)
 
     async def _check_transition_to_awaiting(self, cs: CompleteSet) -> None:
         """Transition COMPLETE → AWAITING_RESOLUTION as soon as window ends (redeem ASAP)."""
@@ -319,6 +322,25 @@ class BotEngine:
         if not cs.window:
             return
 
+        # Both resolution check and redemption use the CTF condition_id (bytes32).
+        # event_id is a Gamma integer and cannot be used with payoutDenominator.
+        condition_id = cs.window.condition_id
+        if not condition_id:
+            logger.error(
+                "Set %s has no CTF condition_id — cannot redeem!", cs.set_id
+            )
+            return
+
+        # Rate-limit per-set RPC checks: the oracle typically resolves minutes
+        # after market close, so hammering payoutDenominator every second wastes
+        # RPC quota and spams logs. Check at most once per 30 seconds per set.
+        now = time.time()
+        _RECHECK_INTERVAL = 30.0
+        last_check = self._redemption_check_times.get(condition_id, 0.0)
+        if now - last_check < _RECHECK_INTERVAL:
+            return
+        self._redemption_check_times[condition_id] = now
+
         # Check deadline — flag if waiting too long
         deadline = self._config.redemption_deadline_seconds
         if cs.window.seconds_since_end > deadline:
@@ -329,18 +351,11 @@ class BotEngine:
                 deadline,
             )
 
-        # Both resolution check and redemption use the CTF condition_id (bytes32).
-        # event_id is a Gamma integer and cannot be used with payoutDenominator.
-        condition_id = cs.window.condition_id
-        if not condition_id:
-            logger.error(
-                "Set %s has no CTF condition_id — cannot redeem!", cs.set_id
-            )
-            return
-
         resolved = await self._order_manager.check_market_resolved(condition_id)
         if not resolved:
             return
+
+        logger.info("Attempting redemption for set %s", cs.set_id)
         success, error = await self._order_manager.redeem_complete_set(condition_id)
 
         if success:
@@ -348,11 +363,25 @@ class BotEngine:
             pnl = self._calculate_redemption_pnl(cs)
             self._tracker.mark_redeemed(cs.set_id)
             self._risk.record_pnl(pnl)
+            self._redemption_check_times.pop(condition_id, None)
             logger.info(
                 "REDEEMED set %s — PnL $%.4f", cs.set_id, pnl,
             )
             await self._telegram.notify_redeemed(cs.set_id, pnl)
         else:
+            # "no tokens redeemed" = already redeemed or wrong collection (non-fatal).
+            # Don't count toward kill switch — only real errors (reverts, RPC down) do.
+            already_redeemed = "no tokens redeemed" in error.lower() or "already redeemed" in error.lower()
+            if already_redeemed:
+                logger.warning(
+                    "Set %s — redeemPositions returned no tokens (%s). "
+                    "Marking redeemed at $0 to avoid re-attempting.",
+                    cs.set_id, error,
+                )
+                self._tracker.mark_redeemed(cs.set_id)
+                self._redemption_check_times.pop(condition_id, None)
+                return
+
             self._tracker.mark_redemption_failed(cs.set_id, error)
             self._risk.record_redemption_failure()
             await self._telegram.notify_error(
