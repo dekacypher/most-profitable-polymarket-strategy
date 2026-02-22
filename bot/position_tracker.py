@@ -104,7 +104,8 @@ class PositionTracker:
 
         target.state = SetState.REDEEMED
         target.completed_at = time.time()
-        target.pnl = round(1.0 - (target.up_leg.price + target.down_leg.price), 4)
+        edge_per_share = 1.0 - (target.up_leg.price + target.down_leg.price)
+        target.pnl = round(edge_per_share * target.up_leg.size, 4)
         self._finalize(target)
 
     def mark_redemption_failed(self, set_id: str, error: str) -> None:

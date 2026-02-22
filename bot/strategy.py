@@ -70,6 +70,15 @@ class CompleteSetStrategy:
         adjusted_size = round(base_size * risk_multiplier, 1)
         adjusted_size = max(adjusted_size, 1.0)
 
+        # Cap size at max_position_pct of bankroll
+        max_exposure = getattr(self._config, "max_total_exposure", 200.0)
+        max_position_pct = getattr(self._config, "max_position_pct", 0.10)
+        if up_bid > 0 and down_bid > 0:
+            max_position_value = max_exposure * max_position_pct
+            avg_price = (up_bid + down_bid) / 2
+            max_size_from_bankroll = max_position_value / avg_price
+            adjusted_size = min(adjusted_size, max_size_from_bankroll)
+
         return QuoteDecision(
             should_quote=True,
             up_bid_price=up_bid,

@@ -47,6 +47,7 @@ class BotConfig:
     max_open_sets: int = 10
     max_daily_loss: float = 50.0       # USD
     max_total_exposure: float = 200.0  # USD total capital at risk
+    max_position_pct: float = 0.10     # Max position size as % of total bankroll (10%)
     one_leg_timeout_seconds: float = 180.0  # 3 minutes
 
     # --- Risk adjustment ---
@@ -105,6 +106,7 @@ def load_config(env_path: str = ".env", live: bool = False) -> BotConfig:
         max_open_sets=int(os.getenv("BOT_MAX_OPEN_SETS", "10")),
         max_daily_loss=float(os.getenv("BOT_MAX_DAILY_LOSS", "50.0")),
         max_total_exposure=float(os.getenv("BOT_MAX_TOTAL_EXPOSURE", "200.0")),
+        max_position_pct=float(os.getenv("BOT_MAX_POSITION_PCT", "0.10")),
         one_leg_timeout_seconds=float(os.getenv("BOT_ONE_LEG_TIMEOUT", "180.0")),
         loss_streak_threshold=int(os.getenv("BOT_LOSS_STREAK_THRESHOLD", "3")),
         loss_streak_scale=float(os.getenv("BOT_LOSS_STREAK_SCALE", "0.5")),
