@@ -104,8 +104,19 @@ class PositionTracker:
 
         target.state = SetState.REDEEMED
         target.completed_at = time.time()
-        edge_per_share = 1.0 - (target.up_leg.price + target.down_leg.price)
-        target.pnl = round(edge_per_share * target.up_leg.size, 4)
+        both_filled = (
+            target.up_leg and target.up_leg.state == OrderState.FILLED
+            and target.down_leg and target.down_leg.state == OrderState.FILLED
+        )
+        if both_filled:
+            cost_per_share = target.up_leg.price + target.down_leg.price
+            target.pnl = round((1.0 - cost_per_share) * target.up_leg.size, 4)
+        else:
+            filled = target.filled_leg()
+            if filled:
+                target.pnl = round((1.0 - filled.price) * filled.size, 4)
+            else:
+                target.pnl = 0.0
         self._finalize(target)
 
     def mark_redemption_failed(self, set_id: str, error: str) -> None:
@@ -129,7 +140,12 @@ class PositionTracker:
 
         target.state = SetState.REDEMPTION_FAILED
         target.completed_at = time.time()
-        target.pnl = -target.combined_cost
+        actual_cost = sum(
+            leg.price * leg.size
+            for leg in (target.up_leg, target.down_leg)
+            if leg and leg.state == OrderState.FILLED
+        )
+        target.pnl = -round(actual_cost if actual_cost > 0 else target.combined_cost, 4)
         self._finalize(target)
         logger.critical(
             "Set %s marked REDEMPTION_FAILED — total loss $%.4f",

@@ -371,14 +371,32 @@ class BotEngine:
         else:
             # "no tokens redeemed" = already redeemed or wrong collection (non-fatal).
             # Don't count toward kill switch — only real errors (reverts, RPC down) do.
-            already_redeemed = "no tokens redeemed" in error.lower() or "already redeemed" in error.lower()
+            # Note: error text is "may already be redeemed" (not "already redeemed" directly).
+            already_redeemed = (
+                "no tokens redeemed" in error.lower()
+                or "already redeemed" in error.lower()
+                or "already be redeemed" in error.lower()
+                or "no positions found" in error.lower()
+            )
             if already_redeemed:
-                logger.warning(
-                    "Set %s — redeemPositions returned no tokens (%s). "
-                    "Marking redeemed at $0 to avoid re-attempting.",
-                    cs.set_id, error,
-                )
-                self._tracker.mark_redeemed(cs.set_id)
+                filled = cs.filled_leg()
+                if filled:
+                    # One-leg hold — token paid out $0 (losing side or already worthless).
+                    # Record the actual capital spent as a loss.
+                    loss = -(filled.price * filled.size)
+                    logger.warning(
+                        "Set %s — no USDC returned for one-leg hold (%s). "
+                        "Recording loss $%.4f.",
+                        cs.set_id, error, abs(loss),
+                    )
+                    self._tracker.mark_abandoned(cs.set_id, loss)
+                else:
+                    logger.warning(
+                        "Set %s — redeemPositions returned no tokens (%s). "
+                        "Marking redeemed to avoid re-attempting.",
+                        cs.set_id, error,
+                    )
+                    self._tracker.mark_redeemed(cs.set_id)
                 self._redemption_check_times.pop(condition_id, None)
                 return
 
